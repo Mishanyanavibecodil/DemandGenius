@@ -1,0 +1,31 @@
+{
+    "thresholds": {
+        "mae": 10.0,
+        "rmse": 15.0,
+        "mape": 20.0
+    },
+    "email": {
+        "smtp_server": "smtp.gmail.com",
+        "smtp_port": 587,
+        "username": "your-email@gmail.com",
+        "password": "your-app-password",
+        "from": "your-email@gmail.com",
+        "to": "recipient@example.com"
+    },
+    "notification": {
+        "cooldown_minutes": 60,
+        "max_alerts_per_day": 10,
+        "alert_levels": {
+            "warning": {
+                "mae": 5.0,
+                "rmse": 7.5,
+                "mape": 10.0
+            },
+            "critical": {
+                "mae": 10.0,
+                "rmse": 15.0,
+                "mape": 20.0
+            }
+        }
+    }
+} 

@@ -4,6 +4,11 @@ from typing import Dict, List, Tuple, Optional, Union
 import logging
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
+from exceptions import *
+from cache import ForecastCache, cached
+import concurrent.futures
+from functools import partial
+import multiprocessing
 
 class DemandForecaster:
     """
@@ -34,38 +39,30 @@ class DemandForecaster:
                 max_growth_multiplier: float - максимальный множитель роста (по умолчанию 3.0)
         
         Raises:
-            ValueError: при некорректных значениях параметров конфигурации
+            ConfigurationError: при некорректных значениях параметров конфигурации
             KeyError: при отсутствии обязательных параметров
         """
-        # Настройка системы логирования
         self._setup_logging()
         self.logger.info("Инициализация DemandForecaster")
         
-        # Проверка наличия обязательных параметров
-        required_params = ['lead_time', 'order_period', 'alpha']
-        for param in required_params:
-            if param not in config:
-                raise KeyError(f"Отсутствует обязательный параметр: {param}")
-        
-        # Инициализация основных параметров
-        self.lead_time = config['lead_time']  # время поставки
-        self.order_period = config['order_period']  # период заказа
-        self.alpha = config['alpha']  # коэффициент сглаживания
-        self.check_trend_days = config.get('check_trend_days', 30)  # период для анализа тренда
-        self.growth_factor = config.get('growth_factor', 1.2)  # фактор роста
-        self.lot_size = config.get('lot_size', 10)  # размер партии
-        self.max_growth_multiplier = config.get('max_growth_multiplier', 3.0)  # максимальный рост
-        
-        # Инициализация категорийных параметров
-        self.lost_demand_factor = config.get('lost_demand_factor', {})  # коэффициенты потерянного спроса
-        self.seasonality_coeffs = config.get('seasonality_coeffs', {})  # сезонные коэффициенты
-        
-        # Инициализация хранилищ данных
-        self.sales_history: Optional[pd.DataFrame] = None  # история продаж
-        self.past_orders: Optional[pd.DataFrame] = None    # история заказов
-        
-        # Валидация конфигурации
-        self._validate_config()
+        try:
+            self._validate_config_structure(config)
+            self._init_parameters(config)
+            self._validate_config_values()
+            
+            # Инициализация кэша
+            self.cache = ForecastCache(
+                max_size=config.get('cache_size', 1000),
+                ttl_seconds=config.get('cache_ttl', 3600)
+            )
+            
+            # Определение количества процессов для параллельных вычислений
+            self.n_processes = config.get('n_processes', 
+                                        max(1, multiprocessing.cpu_count() - 1))
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка инициализации: {str(e)}")
+            raise ConfigurationError(f"Ошибка инициализации: {str(e)}")
 
     def _setup_logging(self) -> None:
         """
@@ -78,157 +75,133 @@ class DemandForecaster:
         )
         self.logger = logging.getLogger(__name__)
 
-    def _validate_config(self) -> None:
-        """
-        Проверка корректности конфигурации.
-        Проверяет типы и диапазоны значений параметров.
-        
-        Raises:
-            ValueError: при некорректных значениях параметров
-        """
-        # Проверка коэффициента сглаживания
+    def _validate_config_structure(self, config: Dict) -> None:
+        """Проверка структуры конфигурации"""
+        required_params = ['lead_time', 'order_period', 'alpha']
+        missing_params = [param for param in required_params if param not in config]
+        if missing_params:
+            raise ConfigurationError(f"Отсутствуют обязательные параметры: {missing_params}")
+
+    def _init_parameters(self, config: Dict) -> None:
+        """Инициализация параметров из конфигурации"""
+        self.lead_time = config['lead_time']
+        self.order_period = config['order_period']
+        self.alpha = config['alpha']
+        self.check_trend_days = config.get('check_trend_days', 30)
+        self.growth_factor = config.get('growth_factor', 1.2)
+        self.lot_size = config.get('lot_size', 10)
+        self.max_growth_multiplier = config.get('max_growth_multiplier', 3.0)
+        self.lost_demand_factor = config.get('lost_demand_factor', {})
+        self.seasonality_coeffs = config.get('seasonality_coeffs', {})
+        self.sales_history = None
+        self.past_orders = None
+
+    def _validate_config_values(self) -> None:
+        """Проверка значений параметров конфигурации"""
         if not isinstance(self.alpha, (int, float)) or not 0 <= self.alpha <= 1:
-            raise ValueError("Alpha должен быть между 0 и 1")
+            raise ConfigurationError("Alpha должен быть между 0 и 1")
             
-        # Проверка размера партии
         if not isinstance(self.lot_size, int) or self.lot_size <= 0:
-            raise ValueError("Размер партии должен быть положительным числом")
+            raise ConfigurationError("Размер партии должен быть положительным числом")
             
-        # Проверка времени поставки
         if not isinstance(self.lead_time, int) or self.lead_time <= 0:
-            raise ValueError("Время поставки должно быть положительным числом")
+            raise ConfigurationError("Время поставки должно быть положительным числом")
             
-        # Проверка периода заказа
         if not isinstance(self.order_period, int) or self.order_period <= 0:
-            raise ValueError("Период заказа должен быть положительным числом")
+            raise ConfigurationError("Период заказа должен быть положительным числом")
             
-        # Проверка максимального множителя роста
         if not isinstance(self.max_growth_multiplier, (int, float)) or self.max_growth_multiplier <= 1:
-            raise ValueError("Максимальный множитель роста должен быть больше 1")
+            raise ConfigurationError("Максимальный множитель роста должен быть больше 1")
+
+    def _validate_sales_data(self, sales_data: pd.DataFrame) -> None:
+        """Валидация данных продаж"""
+        if not isinstance(sales_data, pd.DataFrame):
+            raise DataValidationError("Данные продаж должны быть DataFrame")
+            
+        required_columns = ['date', 'item_id', 'quantity']
+        missing_columns = [col for col in required_columns if col not in sales_data.columns]
+        if missing_columns:
+            raise DataValidationError(f"Отсутствуют обязательные колонки: {missing_columns}")
+            
+        if sales_data['quantity'].isnull().any():
+            raise DataValidationError("Обнаружены пропущенные значения в колонке quantity")
+            
+        if (sales_data['quantity'] < 0).any():
+            raise DataValidationError("Обнаружены отрицательные значения в колонке quantity")
+
+    def _validate_orders_data(self, orders_data: pd.DataFrame) -> None:
+        """Валидация данных заказов"""
+        if not isinstance(orders_data, pd.DataFrame):
+            raise DataValidationError("Данные заказов должны быть DataFrame")
+            
+        required_columns = ['order_id', 'item_id', 'ordered_qty', 'sold_qty']
+        missing_columns = [col for col in required_columns if col not in orders_data.columns]
+        if missing_columns:
+            raise DataValidationError(f"Отсутствуют обязательные колонки: {missing_columns}")
+            
+        if orders_data[['ordered_qty', 'sold_qty']].isnull().any().any():
+            raise DataValidationError("Обнаружены пропущенные значения в данных заказов")
+            
+        if (orders_data['ordered_qty'] < 0).any() or (orders_data['sold_qty'] < 0).any():
+            raise DataValidationError("Обнаружены отрицательные значения в данных заказов")
+
+    def _detect_outliers(self, data: pd.Series, threshold: float = 3.0) -> List[int]:
+        """
+        Обнаружение выбросов с помощью z-score
+        
+        Args:
+            data: Series с данными
+            threshold: пороговое значение для определения выброса
+            
+        Returns:
+            List[int]: индексы выбросов
+        """
+        z_scores = np.abs((data - data.mean()) / data.std())
+        return list(np.where(z_scores > threshold)[0])
 
     def fit(self, sales_history: pd.DataFrame, past_orders: pd.DataFrame) -> None:
         """
-        Обучение модели на исторических данных.
-        Загружает и подготавливает данные для прогнозирования.
+        Обучение модели на исторических данных
         
         Args:
-            sales_history: DataFrame с колонками ['date', 'item_id', 'quantity']
-            past_orders: DataFrame с колонками ['order_id', 'item_id', 'ordered_qty', 'sold_qty']
+            sales_history: DataFrame с историей продаж
+            past_orders: DataFrame с историей заказов
             
         Raises:
-            ValueError: при отсутствии необходимых колонок в данных
+            DataValidationError: при ошибках в данных
+            OutlierError: при обнаружении выбросов
         """
-        self.logger.info("Начало обучения модели")
-        
-        # Проверка наличия необходимых колонок
-        required_columns = {
-            'sales_history': ['date', 'item_id', 'quantity'],
-            'past_orders': ['order_id', 'item_id', 'ordered_qty', 'sold_qty']
-        }
-        
-        # Проверка каждой таблицы на наличие необходимых колонок
-        for df_name, columns in required_columns.items():
-            df = sales_history if df_name == 'sales_history' else past_orders
-            missing_columns = [col for col in columns if col not in df.columns]
-            if missing_columns:
-                raise ValueError(f"В {df_name} отсутствуют колонки: {missing_columns}")
-        
-        # Подготовка данных
-        sales_history['date'] = pd.to_datetime(sales_history['date'])  # преобразование дат
-        sales_history.sort_values(['item_id', 'date'], inplace=True)   # сортировка
-        
-        # Сохранение подготовленных данных
-        self.sales_history = sales_history.copy()
-        self.past_orders = past_orders.copy()
-        
-        self.logger.info(f"Загружено {len(sales_history)} записей продаж")
-        self.logger.info(f"Загружено {len(past_orders)} записей заказов")
+        try:
+            self.logger.info("Начало обучения модели")
+            
+            # Валидация входных данных
+            self._validate_sales_data(sales_history)
+            self._validate_orders_data(past_orders)
+            
+            # Проверка на выбросы
+            outliers = self._detect_outliers(sales_history['quantity'])
+            if outliers:
+                self.logger.warning(f"Обнаружены выбросы в данных продаж: {len(outliers)} точек")
+                raise OutlierError(f"Обнаружены выбросы в данных продаж: {len(outliers)} точек")
+            
+            # Подготовка данных
+            sales_history['date'] = pd.to_datetime(sales_history['date'])
+            sales_history.sort_values(['item_id', 'date'], inplace=True)
+            
+            self.sales_history = sales_history.copy()
+            self.past_orders = past_orders.copy()
+            
+            self.logger.info(f"Загружено {len(sales_history)} записей продаж")
+            self.logger.info(f"Загружено {len(past_orders)} записей заказов")
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при обучении модели: {str(e)}")
+            raise
 
-    def predict(self, item_id: str, days_ahead: int) -> pd.Series:
-        """
-        Прогнозирование спроса для товара.
-        Выполняет многоэтапный прогноз с учетом различных факторов.
-        
-        Args:
-            item_id: идентификатор товара
-            days_ahead: количество дней для прогноза
-            
-        Returns:
-            Series с прогнозируемыми значениями
-            
-        Raises:
-            ValueError: при некорректных входных параметрах
-            KeyError: при отсутствии товара в истории продаж
-        """
-        # Валидация входных параметров
-        if not isinstance(item_id, str):
-            raise ValueError("item_id должен быть строкой")
-        if not isinstance(days_ahead, int) or days_ahead <= 0:
-            raise ValueError("days_ahead должен быть положительным целым числом")
-            
-        self.logger.info(f"Прогнозирование для товара {item_id}, горизонт {days_ahead} дней")
-        
-        # Получение истории продаж для товара
-        item_sales = self.sales_history[self.sales_history['item_id'] == item_id].copy()
-        
-        # Обработка случая отсутствия истории
-        if len(item_sales) == 0:
-            self.logger.warning(f"Нет истории продаж для товара {item_id}")
-            return pd.Series(index=pd.date_range(start=datetime.now(), periods=days_ahead))
-            
-        # Многоэтапный прогноз
-        forecast = self._exp_smoothing(item_sales)  # базовый прогноз
-        trend = self._calculate_trend(item_sales)   # расчет тренда
-        seasonal_forecast = self._apply_seasonality(forecast)  # учет сезонности
-        limited_forecast = self._adjust_for_growth_limit(seasonal_forecast, item_sales['quantity'])  # ограничение роста
-        final_forecast = self._handle_lost_demand(limited_forecast, item_id)  # учет потерянного спроса
-        
-        # Обеспечение неотрицательности прогноза
-        final_forecast = final_forecast.clip(lower=0)
-        
-        return final_forecast
-
-    def calculate_order(self, item_id: str, current_stock: int, incoming_stock: int) -> int:
-        """
-        Расчет рекомендуемого заказа.
-        Учитывает текущий запас, поступающий запас и прогноз спроса.
-        
-        Args:
-            item_id: идентификатор товара
-            current_stock: текущий запас
-            incoming_stock: поступающий запас
-            
-        Returns:
-            рекомендованное количество для заказа
-            
-        Raises:
-            ValueError: при некорректных значениях запасов
-        """
-        # Валидация входных параметров
-        if not isinstance(current_stock, int) or current_stock < 0:
-            raise ValueError("current_stock должен быть неотрицательным целым числом")
-        if not isinstance(incoming_stock, int) or incoming_stock < 0:
-            raise ValueError("incoming_stock должен быть неотрицательным целым числом")
-            
-        self.logger.info(f"Расчет заказа для товара {item_id}")
-        
-        # Прогноз на период поставки и заказа
-        forecast = self.predict(item_id, self.lead_time + self.order_period)
-        
-        # Расчет дефицита
-        deficit = self._calculate_deficit(current_stock, incoming_stock, forecast[:self.lead_time])
-        
-        # Округление до размера партии
-        order_quantity = max(0, deficit)
-        order_quantity = ((order_quantity + self.lot_size - 1) // self.lot_size) * self.lot_size
-        
-        self.logger.info(f"Рекомендуемый заказ для {item_id}: {order_quantity}")
-        return order_quantity
-
+    @cached(maxsize=128)
     def _exp_smoothing(self, sales_data: pd.DataFrame) -> pd.Series:
         """
-        Экспоненциальное сглаживание.
-        Использует свертку для эффективного расчета.
+        Экспоненциальное сглаживание с кэшированием
         
         Args:
             sales_data: DataFrame с данными продаж
@@ -242,6 +215,164 @@ class DemandForecaster:
                        mode='full')[:len(sales_data)],
             index=sales_data['date']
         )
+
+    def predict(self, item_id: str, days_ahead: int) -> pd.Series:
+        """
+        Прогнозирование спроса для товара с использованием кэша
+        
+        Args:
+            item_id: идентификатор товара
+            days_ahead: количество дней для прогноза
+            
+        Returns:
+            Series с прогнозируемыми значениями
+        """
+        try:
+            # Проверка кэша
+            cached_forecast = self.cache.get(item_id, days_ahead)
+            if cached_forecast is not None:
+                self.logger.info(f"Использован кэшированный прогноз для {item_id}")
+                return cached_forecast
+                
+            if not isinstance(item_id, str):
+                raise ValueError("item_id должен быть строкой")
+            if not isinstance(days_ahead, int) or days_ahead <= 0:
+                raise ValueError("days_ahead должен быть положительным целым числом")
+                
+            self.logger.info(f"Прогнозирование для товара {item_id}, горизонт {days_ahead} дней")
+            
+            if self.sales_history is None:
+                raise PredictionError("Модель не обучена")
+                
+            item_sales = self.sales_history[self.sales_history['item_id'] == item_id].copy()
+            
+            if len(item_sales) == 0:
+                self.logger.warning(f"Нет истории продаж для товара {item_id}")
+                return pd.Series(index=pd.date_range(start=datetime.now(), periods=days_ahead))
+                
+            forecast = self._exp_smoothing(item_sales)
+            trend = self._calculate_trend(item_sales)
+            seasonal_forecast = self._apply_seasonality(forecast)
+            limited_forecast = self._adjust_for_growth_limit(seasonal_forecast, item_sales['quantity'])
+            final_forecast = self._handle_lost_demand(limited_forecast, item_id)
+            
+            final_forecast = final_forecast.clip(lower=0)
+            
+            # Сохранение в кэш
+            self.cache.set(item_id, days_ahead, final_forecast)
+            
+            return final_forecast
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при прогнозировании: {str(e)}")
+            raise PredictionError(f"Ошибка при прогнозировании: {str(e)}")
+
+    def predict_batch(self, item_ids: List[str], days_ahead: int) -> Dict[str, pd.Series]:
+        """
+        Параллельное прогнозирование для нескольких товаров
+        
+        Args:
+            item_ids: список идентификаторов товаров
+            days_ahead: количество дней для прогноза
+            
+        Returns:
+            Dict[str, pd.Series]: словарь с прогнозами для каждого товара
+        """
+        results = {}
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.n_processes) as executor:
+            # Создание частичной функции с фиксированным параметром days_ahead
+            predict_func = partial(self.predict, days_ahead=days_ahead)
+            
+            # Параллельное выполнение прогнозов
+            future_to_item = {
+                executor.submit(predict_func, item_id): item_id 
+                for item_id in item_ids
+            }
+            
+            # Сбор результатов
+            for future in concurrent.futures.as_completed(future_to_item):
+                item_id = future_to_item[future]
+                try:
+                    results[item_id] = future.result()
+                except Exception as e:
+                    self.logger.error(f"Ошибка при прогнозировании для {item_id}: {str(e)}")
+                    results[item_id] = pd.Series(index=pd.date_range(start=datetime.now(), periods=days_ahead))
+                    
+        return results
+
+    def calculate_order(self, item_id: str, current_stock: int, incoming_stock: int) -> int:
+        """
+        Расчет рекомендуемого заказа
+        
+        Args:
+            item_id: идентификатор товара
+            current_stock: текущий запас
+            incoming_stock: поступающий запас
+            
+        Returns:
+            рекомендованное количество для заказа
+            
+        Raises:
+            OrderCalculationError: при ошибках расчета заказа
+            ValueError: при некорректных значениях запасов
+        """
+        try:
+            if not isinstance(current_stock, int) or current_stock < 0:
+                raise ValueError("current_stock должен быть неотрицательным целым числом")
+            if not isinstance(incoming_stock, int) or incoming_stock < 0:
+                raise ValueError("incoming_stock должен быть неотрицательным целым числом")
+                
+            self.logger.info(f"Расчет заказа для товара {item_id}")
+            
+            forecast = self.predict(item_id, self.lead_time + self.order_period)
+            deficit = self._calculate_deficit(current_stock, incoming_stock, forecast[:self.lead_time])
+            
+            order_quantity = max(0, deficit)
+            order_quantity = ((order_quantity + self.lot_size - 1) // self.lot_size) * self.lot_size
+            
+            self.logger.info(f"Рекомендуемый заказ для {item_id}: {order_quantity}")
+            return order_quantity
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при расчете заказа: {str(e)}")
+            raise OrderCalculationError(f"Ошибка при расчете заказа: {str(e)}")
+
+    def calculate_orders_batch(self, items_data: List[Dict[str, Any]]) -> Dict[str, int]:
+        """
+        Параллельный расчет заказов для нескольких товаров
+        
+        Args:
+            items_data: список словарей с данными товаров
+                      [{'item_id': str, 'current_stock': int, 'incoming_stock': int}, ...]
+                      
+        Returns:
+            Dict[str, int]: словарь с рекомендуемыми заказами
+        """
+        results = {}
+        
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.n_processes) as executor:
+            # Параллельное выполнение расчетов
+            future_to_item = {
+                executor.submit(
+                    self.calculate_order,
+                    item['item_id'],
+                    item['current_stock'],
+                    item['incoming_stock']
+                ): item['item_id'] 
+                for item in items_data
+            }
+            
+            # Сбор результатов
+            for future in concurrent.futures.as_completed(future_to_item):
+                item_id = future_to_item[future]
+                try:
+                    results[item_id] = future.result()
+                except Exception as e:
+                    self.logger.error(f"Ошибка при расчете заказа для {item_id}: {str(e)}")
+                    results[item_id] = 0
+                    
+        return results
 
     def _calculate_trend(self, sales_data: pd.DataFrame) -> float:
         """
@@ -379,3 +510,35 @@ class DemandForecaster:
         plt.xticks(rotation=45)
         plt.tight_layout()
         plt.show()
+
+    def optimize_data_storage(self) -> None:
+        """
+        Оптимизация хранения данных для больших наборов
+        """
+        if self.sales_history is not None:
+            # Оптимизация типов данных
+            self.sales_history['quantity'] = pd.to_numeric(
+                self.sales_history['quantity'], 
+                downcast='integer'
+            )
+            
+            # Создание индекса для ускорения поиска
+            self.sales_history.set_index(['item_id', 'date'], inplace=True)
+            self.sales_history.sort_index(inplace=True)
+            
+        if self.past_orders is not None:
+            # Оптимизация типов данных
+            for col in ['ordered_qty', 'sold_qty']:
+                self.past_orders[col] = pd.to_numeric(
+                    self.past_orders[col], 
+                    downcast='integer'
+                )
+                
+            # Создание индекса для ускорения поиска
+            self.past_orders.set_index(['item_id', 'order_id'], inplace=True)
+            self.past_orders.sort_index(inplace=True)
+
+    def clear_cache(self) -> None:
+        """Очистка кэша прогнозов"""
+        self.cache.clear()
+        self.logger.info("Кэш прогнозов очищен")
